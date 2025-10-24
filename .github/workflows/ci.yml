@@ -1,0 +1,96 @@
+on:
+  workflow_dispatch:
+    inputs:
+      ruby-version:
+        description: '`.ruby-version` file content'
+        required: true
+        type: string
+      gemset:
+        description: 'URL to gemset.nix'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+
+    runs-on: ${{ matrix.os }}
+
+    outputs:
+      image: ${{ steps.set-image-name.outputs.image }}
+
+    steps:
+      - uses: levibostian/action-hide-sensitive-inputs@v1
+        with:
+          exclude_inputs: ruby-version
+
+      - uses: actions/checkout@v6
+
+      - uses: docker/login-action@v3
+        with:
+          username: hssmateus
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - run: |
+          set -eux
+
+          curl -OJ https://paste.sh
+          chmod +x paste.sh
+
+          echo "$RUBY_VERSION" > .ruby-version
+          ./paste.sh "$GEMSET" > gemset.nix
+        env:
+          RUBY_VERSION: ${{ inputs.ruby-version }}
+          GEMSET: ${{ inputs.gemset }}
+
+      - uses: nixbuild/nix-quick-install-action@v34
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Restore and cache Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ matrix.os }}-${{ hashFiles('**/*.nix', '**/flake.lock', '.ruby-version') }}
+          restore-prefixes-first-match: nix-${{ matrix.os }}
+          gc-max-store-size-linux: 1073741824
+
+      - id: set-image-name
+        run: |
+          hash=($(md5sum gemset.nix))
+          IMAGE="hssmateus/ruby-env:$hash-ruby-$(cat .ruby-version)"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - run: |
+          nix build .#image.copyTo \
+            --impure \
+            --override-input rubyVersionFile path:.ruby-version \
+            --override-input gemset path:gemset.nix
+
+          ./result/bin/copy-to "docker://docker.io/$IMAGE-${{ runner.arch }}"
+        env:
+          NIXPKGS_ALLOW_UNFREE: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          username: hssmateus
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - run: |
+          docker manifest create "$IMAGE" \
+            --amend "$IMAGE-X64" \
+            --amend "$IMAGE-ARM64"
+
+          docker manifest push "$IMAGE"
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
